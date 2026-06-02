@@ -1,12 +1,6 @@
--- 1. What do cataract-related Level3 names look like?
-SELECT DISTINCT ID, Code, Level3, Level1
-FROM TPAProcedures
-WHERE Deleted = 0 AND Level3 LIKE '%cataract%'
-ORDER BY Level3;
+<img width="571" height="194" alt="image" src="https://github.com/user-attachments/assets/f620eea8-f1ca-44a0-9b7f-14466ee70f70" />
 
--- 2. What do maternity/delivery Level3 names look like?
-SELECT DISTINCT ID, Code, Level3, Level1
-FROM TPAProcedures
-WHERE Deleted = 0 AND (Level3 LIKE '%maternit%' OR Level3 LIKE '%delivery%'
-   OR Level3 LIKE '%LSCS%' OR Level3 LIKE '%caesar%' OR Level3 LIKE '%pregnan%')
-ORDER BY Level3;
+<img width="559" height="479" alt="image" src="https://github.com/user-attachments/assets/06b6865b-b86a-4ef3-9ac5-1fe32f9ed05e" />
+
+<img width="565" height="82" alt="image" src="https://github.com/user-attachments/assets/a7d48a65-3f98-452e-90cb-db045152e134" />
+
