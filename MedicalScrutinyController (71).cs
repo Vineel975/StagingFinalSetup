@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Web;
@@ -8353,6 +8353,384 @@ namespace Enrollment.Controllers
             }
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // STAGING — STEP 4: the batch worker.
+        //
+        // GET /MedicalScrutiny/ProcessStagingClaims
+        //
+        // Triggered every 5 min by Windows Task Scheduler (Modified Option A).
+        // For each claim held at StageID 52 that has not yet been processed:
+        //   1. classify disease (GetClaimDiseaseTypeForStaging)
+        //   2. if not cataract/maternity -> mark 'skipped', flip to stage 5
+        //   3. else: fetch docs (env-based, reuses GetMedicalBillDocument /
+        //      GetTariffDocument internally), submit to ClaimAI /api/audit/start
+        //      (which processes synchronously and returns a jobId), then pull the
+        //      result from /api/staging/result, store it in ClaimAI_Results, and
+        //      flip the claim to stage 5.
+        //   4. on ANY failure -> mark 'failed', flip to stage 5 (fail-open: the
+        //      doctor processes on-demand when they open the claim, as today).
+        //
+        // AllowAnonymous/OverrideAuthorization: the scheduler calls this with no
+        // user session. Optional shared-secret check via StagingApiKey header.
+        // ════════════════════════════════════════════════════════════════════
+        [HttpGet]
+        [AllowAnonymous]
+        [OverrideAuthorization]
+        public ActionResult ProcessStagingClaims(int batchSize = 10)
+        {
+            int processed = 0, skipped = 0, failed = 0;
+            var details = new System.Collections.Generic.List<object>();
+
+            try
+            {
+                // Optional auth: if StagingApiKey is configured, require the header.
+                string stagingKey = System.Configuration.ConfigurationManager.AppSettings["StagingApiKey"] ?? "";
+                if (!string.IsNullOrEmpty(stagingKey))
+                {
+                    string reqKey = Request.Headers["x-staging-key"] ?? Request.QueryString["key"] ?? "";
+                    if (reqKey != stagingKey)
+                        return Json(new { Success = false, Message = "Unauthorized" }, JsonRequestBehavior.AllowGet);
+                }
+
+                string connStr = GetStagingConnString();
+                if (string.IsNullOrWhiteSpace(connStr))
+                    return Json(new { Success = false, Message = "No connection string." }, JsonRequestBehavior.AllowGet);
+
+                if (batchSize <= 0 || batchSize > 50) batchSize = 10;
+
+                // ── Find claims to process: StageID 52, no ClaimAI_Results row yet
+                //    (or status NULL). 'processing'/'done'/'failed'/'skipped' are
+                //    excluded so we never double-pick. ───────────────────────────
+                var claimIds = new System.Collections.Generic.List<long>();
+                using (var conn = new System.Data.SqlClient.SqlConnection(connStr))
+                {
+                    conn.Open();
+                    var cmd = conn.CreateCommand();
+                    cmd.CommandText = @"
+                        SELECT TOP (@bs) c.ID
+                        FROM Claims c WITH (NOLOCK)
+                        LEFT JOIN dbo.ClaimAI_Results r WITH (NOLOCK) ON r.ClaimID = c.ID
+                        WHERE c.StageID = 52
+                          AND ISNULL(c.Deleted, 0) = 0
+                          AND (r.ID IS NULL OR r.ProcessingStatus IS NULL)
+                        ORDER BY c.ID DESC";
+                    cmd.Parameters.AddWithValue("@bs", batchSize);
+                    using (var rdr = cmd.ExecuteReader())
+                        while (rdr.Read()) claimIds.Add(Convert.ToInt64(rdr["ID"]));
+                }
+
+                foreach (long claimId in claimIds)
+                {
+                    try
+                    {
+                        // Latest Slno for this claim.
+                        int slNo = 1;
+                        using (var conn = new System.Data.SqlClient.SqlConnection(connStr))
+                        {
+                            conn.Open();
+                            var cmd = conn.CreateCommand();
+                            cmd.CommandText = "SELECT TOP 1 Slno FROM Claimsdetails WHERE ClaimID=@cid AND ISNULL(Deleted,0)=0 ORDER BY Slno";
+                            cmd.Parameters.AddWithValue("@cid", claimId);
+                            var v = cmd.ExecuteScalar();
+                            if (v != null && v != DBNull.Value) slNo = Convert.ToInt32(v);
+                        }
+
+                        // 1. Classify disease.
+                        string disease = GetClaimDiseaseTypeForStaging(claimId, connStr);
+
+                        // 2. Not supported -> skip, go straight to stage 5.
+                        if (disease != "cataract" && disease != "maternity")
+                        {
+                            UpsertStagingResult(connStr, claimId, slNo, disease, "skipped",
+                                null, null, null, null, null);
+                            SetClaimStage(connStr, claimId, 5);
+                            skipped++;
+                            details.Add(new { claimId, disease, status = "skipped" });
+                            continue;
+                        }
+
+                        // 3. Lock: mark 'processing' so a concurrent run won't re-pick.
+                        UpsertStagingResult(connStr, claimId, slNo, disease, "processing",
+                            null, null, null, null, null);
+
+                        // 4. Fetch docs internally (no session) — reuse existing
+                        //    env-based GetMedicalBillDocument / GetTariffDocument.
+                        string billB64 = null, billName = null, tarB64 = null, tarName = null;
+                        _stagingInternalCall = true;
+                        try
+                        {
+                            ExtractDocBase64(GetMedicalBillDocument(claimId.ToString(), slNo.ToString()),
+                                out billB64, out billName);
+                            try
+                            {
+                                ExtractDocBase64(GetTariffDocument(claimId.ToString(), slNo.ToString()),
+                                    out tarB64, out tarName);
+                            }
+                            catch { /* tariff optional */ }
+                        }
+                        finally
+                        {
+                            _stagingInternalCall = false;
+                        }
+
+                        if (string.IsNullOrEmpty(billB64))
+                            throw new Exception("Medical bill not found for claimId=" + claimId);
+
+                        // 5. Submit to ClaimAI (synchronous: returns jobId once done).
+                        string jobId = SubmitClaimToClaimAI(claimId.ToString(), billName, billB64,
+                            tarName, tarB64, disease);
+                        if (string.IsNullOrWhiteSpace(jobId))
+                            throw new Exception("ClaimAI did not return a jobId.");
+
+                        // 6. Pull the stored result.
+                        string analysisJson, benefitPlan, pdfUrl, aiStatus;
+                        GetStagingResultFromClaimAI(jobId, out aiStatus, out analysisJson,
+                            out benefitPlan, out pdfUrl);
+
+                        if (aiStatus == "error")
+                            throw new Exception("ClaimAI reported processing error for jobId=" + jobId);
+
+                        // 7. Fetch processed PDF bytes from the URL (best-effort).
+                        byte[] pdfBytes = null;
+                        if (!string.IsNullOrWhiteSpace(pdfUrl))
+                        {
+                            try { pdfBytes = DownloadBytes(pdfUrl); }
+                            catch (Exception pdfEx)
+                            { System.Diagnostics.Debug.WriteLine("[Staging] PDF download failed: " + pdfEx.Message); }
+                        }
+
+                        // 8. Store results + flip to stage 5.
+                        UpsertStagingResult(connStr, claimId, slNo, disease, "done",
+                            jobId, analysisJson, benefitPlan, pdfBytes, null);
+                        SetClaimStage(connStr, claimId, 5);
+                        processed++;
+                        details.Add(new { claimId, disease, status = "done", jobId });
+                    }
+                    catch (Exception claimEx)
+                    {
+                        // Fail-open: mark failed, send to stage 5 for on-demand processing.
+                        try
+                        {
+                            UpsertStagingResult(connStr, claimId, slNo: 1, diseaseType: null,
+                                status: "failed", jobId: null, analysisJson: null,
+                                benefitPlan: null, pdfBytes: null, lastError: claimEx.Message);
+                            SetClaimStage(connStr, claimId, 5);
+                        }
+                        catch { /* swallow — never let one claim break the batch */ }
+                        failed++;
+                        details.Add(new { claimId, status = "failed", error = claimEx.Message });
+                        TariffLog("[Staging] Claim " + claimId + " failed: " + claimEx.Message);
+                    }
+                }
+
+                return Json(new
+                {
+                    Success = true,
+                    Processed = processed,
+                    Skipped = skipped,
+                    Failed = failed,
+                    Total = claimIds.Count,
+                    Details = details
+                }, JsonRequestBehavior.AllowGet);
+            }
+            catch (Exception ex)
+            {
+                return Json(new { Success = false, Message = ex.Message }, JsonRequestBehavior.AllowGet);
+            }
+        }
+
+        // ── Staging helper: resolve the raw SQL connection string ─────────────
+        private string GetStagingConnString()
+        {
+            string connStr = System.Configuration.ConfigurationManager
+                .ConnectionStrings["McarePlusEntities"]?.ConnectionString ?? "";
+            if (connStr.StartsWith("metadata=", StringComparison.OrdinalIgnoreCase))
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(
+                    connStr, "provider connection string=\\\"([^\\\"]+)\\\"",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (m.Success) connStr = m.Groups[1].Value.Replace("&quot;", "\"");
+            }
+            return connStr;
+        }
+
+        // ── Staging helper: pull { Success, Data.base64Content, Data.fileName }
+        //    out of the JsonResult returned by GetMedicalBillDocument/GetTariffDocument.
+        private void ExtractDocBase64(ActionResult result, out string base64, out string fileName)
+        {
+            base64 = null; fileName = null;
+            var jr = result as JsonResult;
+            if (jr == null || jr.Data == null) return;
+            try
+            {
+                dynamic d = jr.Data;
+                bool ok = (bool?)d.Success ?? false;
+                if (!ok || d.Data == null) return;
+                base64   = (string)d.Data.base64Content;
+                fileName = (string)d.Data.fileName;
+            }
+            catch { /* shape mismatch -> leave null */ }
+        }
+
+        // ── Staging helper: insert/update the ClaimAI_Results row for a claim ──
+        private void UpsertStagingResult(
+            string connStr, long claimId, int slNo, string diseaseType, string status,
+            string jobId, string analysisJson, string benefitPlan, byte[] pdfBytes, string lastError)
+        {
+            using (var conn = new System.Data.SqlClient.SqlConnection(connStr))
+            {
+                conn.Open();
+                var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+                    MERGE dbo.ClaimAI_Results AS t
+                    USING (SELECT @ClaimID AS ClaimID, @SlNo AS SlNo) AS s
+                       ON (t.ClaimID = s.ClaimID AND t.SlNo = s.SlNo)
+                    WHEN MATCHED THEN UPDATE SET
+                        DiseaseType      = COALESCE(@DiseaseType, t.DiseaseType),
+                        ProcessingStatus = @Status,
+                        ClaimAI_JobId    = COALESCE(@JobId, t.ClaimAI_JobId),
+                        AnalysisJson     = COALESCE(@AnalysisJson, t.AnalysisJson),
+                        BenefitPlan      = COALESCE(@BenefitPlan, t.BenefitPlan),
+                        ProcessedPdf     = COALESCE(@ProcessedPdf, t.ProcessedPdf),
+                        AttemptCount     = t.AttemptCount + 1,
+                        LastError        = @LastError,
+                        SubmittedAt      = CASE WHEN @Status = 'processing' THEN GETDATE() ELSE t.SubmittedAt END,
+                        ProcessedAt      = CASE WHEN @Status IN ('done','failed','skipped') THEN GETDATE() ELSE t.ProcessedAt END
+                    WHEN NOT MATCHED THEN INSERT
+                        (ClaimID, SlNo, DiseaseType, ProcessingStatus, ClaimAI_JobId,
+                         AnalysisJson, BenefitPlan, ProcessedPdf, AttemptCount, LastError,
+                         CreatedAt, SubmittedAt, ProcessedAt)
+                    VALUES
+                        (@ClaimID, @SlNo, @DiseaseType, @Status, @JobId,
+                         @AnalysisJson, @BenefitPlan, @ProcessedPdf, 1, @LastError,
+                         GETDATE(),
+                         CASE WHEN @Status = 'processing' THEN GETDATE() ELSE NULL END,
+                         CASE WHEN @Status IN ('done','failed','skipped') THEN GETDATE() ELSE NULL END);";
+
+                cmd.Parameters.AddWithValue("@ClaimID", claimId);
+                cmd.Parameters.AddWithValue("@SlNo", slNo);
+                cmd.Parameters.AddWithValue("@DiseaseType", (object)diseaseType ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@Status", (object)status ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@JobId", (object)jobId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@AnalysisJson", (object)analysisJson ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@BenefitPlan", (object)benefitPlan ?? DBNull.Value);
+                var pdfParam = cmd.Parameters.Add("@ProcessedPdf", System.Data.SqlDbType.VarBinary, -1);
+                pdfParam.Value = (object)pdfBytes ?? DBNull.Value;
+                cmd.Parameters.AddWithValue("@LastError",
+                    (object)(lastError != null && lastError.Length > 2000 ? lastError.Substring(0, 2000) : lastError) ?? DBNull.Value);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        // ── Staging helper: flip a claim's stage ──────────────────────────────
+        private void SetClaimStage(string connStr, long claimId, int stageId)
+        {
+            using (var conn = new System.Data.SqlClient.SqlConnection(connStr))
+            {
+                conn.Open();
+                var cmd = conn.CreateCommand();
+                cmd.CommandText = "UPDATE Claims SET StageID = @stage WHERE ID = @cid";
+                cmd.Parameters.AddWithValue("@stage", stageId);
+                cmd.Parameters.AddWithValue("@cid", claimId);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        // ── Staging helper: submit docs to ClaimAI /api/audit/start (synchronous),
+        //    reusing the multipart mechanics from StartClaimAuditProxy. Returns jobId.
+        private string SubmitClaimToClaimAI(
+            string claimId, string billName, string billB64,
+            string tarName, string tarB64, string disease)
+        {
+            byte[] medBytes = Convert.FromBase64String(billB64);
+            byte[] tarBytes = null;
+            if (!string.IsNullOrWhiteSpace(tarB64))
+            {
+                try { tarBytes = Convert.FromBase64String(tarB64); } catch { }
+            }
+
+            // Minimal spectraFields — the browser builds these from the DOM, but the
+            // worker has none. Pass claimType; ClaimAI fills the rest from its own DB.
+            string spectraFieldsJson = Newtonsoft.Json.JsonConvert.SerializeObject(new { claimType = disease });
+
+            string claimAiUrl = (System.Configuration.ConfigurationManager.AppSettings["ClaimAIUrl"]
+                ?? "http://localhost:3000").TrimEnd('/') + "/api/audit/start";
+
+            System.Net.ServicePointManager.SecurityProtocol =
+                System.Net.SecurityProtocolType.Tls12 |
+                System.Net.SecurityProtocolType.Tls11 |
+                System.Net.SecurityProtocolType.Tls;
+            System.Net.ServicePointManager.ServerCertificateValidationCallback =
+                (sender, cert, chain, errors) => true;
+
+            string boundary = "ClaimAIBoundary" + Guid.NewGuid().ToString("N");
+            byte[] multipartBody = BuildMultipartBody(
+                boundary, claimId, billName ?? "medical-bill.pdf", medBytes,
+                tarName, tarBytes, spectraFieldsJson);
+
+            using (var client = new System.Net.Http.HttpClient())
+            {
+                client.Timeout = TimeSpan.FromMinutes(3);
+                var req = new System.Net.Http.HttpRequestMessage(
+                    System.Net.Http.HttpMethod.Post, claimAiUrl);
+                var bodyContent = new System.Net.Http.ByteArrayContent(multipartBody);
+                bodyContent.Headers.ContentType = System.Net.Http.Headers.MediaTypeHeaderValue.Parse(
+                    "multipart/form-data; boundary=" + boundary);
+                req.Content = bodyContent;
+
+                var resp = client.SendAsync(req).GetAwaiter().GetResult();
+                string respBody = resp.Content.ReadAsStringAsync().Result;
+                if (!resp.IsSuccessStatusCode)
+                    throw new Exception("ClaimAI audit/start HTTP " + (int)resp.StatusCode + ": " + respBody);
+
+                dynamic convexRes = Newtonsoft.Json.JsonConvert.DeserializeObject(respBody);
+                return convexRes?.jobId?.ToString() ?? "";
+            }
+        }
+
+        // ── Staging helper: GET /api/staging/result?jobId= ────────────────────
+        private void GetStagingResultFromClaimAI(
+            string jobId, out string status, out string analysisJson,
+            out string benefitPlan, out string processedPdfUrl)
+        {
+            status = null; analysisJson = null; benefitPlan = null; processedPdfUrl = null;
+
+            string baseUrl = (System.Configuration.ConfigurationManager.AppSettings["ClaimAIUrl"]
+                ?? "http://localhost:3000").TrimEnd('/');
+            string url = baseUrl + "/api/staging/result?jobId=" + Uri.EscapeDataString(jobId);
+
+            using (var client = new System.Net.Http.HttpClient())
+            {
+                client.Timeout = TimeSpan.FromMinutes(2);
+                var resp = client.GetAsync(url).GetAwaiter().GetResult();
+                string respBody = resp.Content.ReadAsStringAsync().Result;
+                if (!resp.IsSuccessStatusCode)
+                    throw new Exception("staging/result HTTP " + (int)resp.StatusCode + ": " + respBody);
+
+                dynamic r = Newtonsoft.Json.JsonConvert.DeserializeObject(respBody);
+                status = r?.status?.ToString();
+                // analysis is a JSON object — re-serialize it to store as text.
+                if (r?.analysis != null)
+                    analysisJson = Newtonsoft.Json.JsonConvert.SerializeObject(r.analysis);
+                benefitPlan     = r?.benefitPlan?.ToString();
+                processedPdfUrl = r?.processedPdfUrl?.ToString();
+            }
+        }
+
+        // ── Staging helper: download bytes from a URL (the processed PDF) ──────
+        private byte[] DownloadBytes(string url)
+        {
+            System.Net.ServicePointManager.SecurityProtocol =
+                System.Net.SecurityProtocolType.Tls12 |
+                System.Net.SecurityProtocolType.Tls11 |
+                System.Net.SecurityProtocolType.Tls;
+            using (var client = new System.Net.Http.HttpClient())
+            {
+                client.Timeout = TimeSpan.FromMinutes(2);
+                return client.GetByteArrayAsync(url).GetAwaiter().GetResult();
+            }
+        }
+
         /// <summary>
         /// GET /MedicalScrutiny/GetCodingProcedureEligibleLimit
         /// Called by ClaimAI to get the exact DB-calculated benefit plan limit
@@ -8689,6 +9067,12 @@ namespace Enrollment.Controllers
         // browser console when AI Summary is opened. Cross-check only.
         private string _lastTariffSelectionLog = "";
 
+        // Set true by the staging worker (ProcessStagingClaims) while it calls
+        // GetMedicalBillDocument / GetTariffDocument internally, so those methods
+        // skip the user-session gate (the worker has no session). Always reset to
+        // false in a finally block. Browser-initiated calls never set it.
+        private bool _stagingInternalCall = false;
+
         private System.Tuple<string, byte[]> PickTariffFileWithAI(
             System.Collections.Generic.List<System.Tuple<string, DateTime, byte[]>> candidates,
             bool isPsu, string insurerCode)
@@ -8971,7 +9355,11 @@ namespace Enrollment.Controllers
             var res = new ApiResponse<object>();
             try
             {
-                if (Session[SessionValue.UserRegionID] == null)
+                // Session check applies to browser-initiated calls only. The staging
+                // worker (ProcessStagingClaims) calls this method internally with no
+                // user session — _stagingInternalCall is set true for that path so we
+                // skip the session gate. Browser calls leave it false → gate enforced.
+                if (!_stagingInternalCall && Session[SessionValue.UserRegionID] == null)
                 {
                     res.Success = false; res.ErrorCode = "ErrorCode#1";
                     res.Message = "Session expired.";
@@ -9174,7 +9562,9 @@ namespace Enrollment.Controllers
             var res = new ApiResponse<object>();
             try
             {
-                if (Session[SessionValue.UserRegionID] == null)
+                // See GetMedicalBillDocument: skip the session gate for internal
+                // staging-worker calls (no user session); enforce it for browser calls.
+                if (!_stagingInternalCall && Session[SessionValue.UserRegionID] == null)
                 {
                     res.Success = false; res.ErrorCode = "ErrorCode#1";
                     res.Message = "Session expired.";
