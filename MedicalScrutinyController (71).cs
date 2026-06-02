@@ -8555,19 +8555,40 @@ namespace Enrollment.Controllers
         }
 
         // ── Staging helper: pull { Success, Data.base64Content, Data.fileName }
-        //    out of the JsonResult returned by GetMedicalBillDocument/GetTariffDocument.
+        //    out of the result returned by GetMedicalBillDocument/GetTariffDocument.
+        //    Those methods return EITHER a JsonResult (DMS/S3 path, via Json(res))
+        //    OR a ContentResult (local-zip path, via Content(serializer.Serialize(res),
+        //    "application/json") — used so the huge base64 isn't limited by the
+        //    default JsonResult MaxJsonLength). Handle both.
         private void ExtractDocBase64(ActionResult result, out string base64, out string fileName)
         {
             base64 = null; fileName = null;
-            var jr = result as JsonResult;
-            if (jr == null || jr.Data == null) return;
+            if (result == null) return;
             try
             {
-                dynamic d = jr.Data;
-                bool ok = (bool?)d.Success ?? false;
-                if (!ok || d.Data == null) return;
-                base64   = (string)d.Data.base64Content;
-                fileName = (string)d.Data.fileName;
+                // Case 1: ContentResult — a serialized JSON string.
+                var cr = result as ContentResult;
+                if (cr != null && !string.IsNullOrEmpty(cr.Content))
+                {
+                    dynamic parsed = Newtonsoft.Json.JsonConvert.DeserializeObject(cr.Content);
+                    bool okC = (bool?)parsed?.Success ?? false;
+                    if (!okC || parsed?.Data == null) return;
+                    base64   = (string)parsed.Data.base64Content;
+                    fileName = (string)parsed.Data.fileName;
+                    return;
+                }
+
+                // Case 2: JsonResult — read the typed object directly.
+                var jr = result as JsonResult;
+                if (jr != null && jr.Data != null)
+                {
+                    dynamic d = jr.Data;
+                    bool ok = (bool?)d.Success ?? false;
+                    if (!ok || d.Data == null) return;
+                    base64   = (string)d.Data.base64Content;
+                    fileName = (string)d.Data.fileName;
+                    return;
+                }
             }
             catch { /* shape mismatch -> leave null */ }
         }
