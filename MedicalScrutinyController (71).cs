@@ -8731,6 +8731,75 @@ namespace Enrollment.Controllers
             }
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // STAGING — STEP 6: claim-open lookup.
+        //
+        // GET /MedicalScrutiny/GetStagingResultForClaim?claimId=123
+        //
+        // Called by the claim page on load. If the claim was already pre-processed
+        // by staging (ProcessingStatus = 'done' with a jobId), the page can render
+        // the AI summary instantly from that jobId instead of running the on-demand
+        // InitAiSummary flow.
+        //
+        // Returns:
+        //   { Success, HasResult, Status, JobId, DiseaseType }
+        //     HasResult = true only when Status = 'done' AND a jobId exists.
+        //   Any other status (processing / failed / skipped / none) -> HasResult=false,
+        //   and the page falls back to on-demand processing (today's behaviour).
+        // ════════════════════════════════════════════════════════════════════
+        [HttpGet]
+        public ActionResult GetStagingResultForClaim(string claimId)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(claimId) ||
+                    !long.TryParse(claimId.Trim(), out long cId))
+                    return Json(new { Success = true, HasResult = false }, JsonRequestBehavior.AllowGet);
+
+                string connStr = GetStagingConnString();
+                if (string.IsNullOrWhiteSpace(connStr))
+                    return Json(new { Success = true, HasResult = false }, JsonRequestBehavior.AllowGet);
+
+                string status = null, jobId = null, disease = null;
+                using (var conn = new System.Data.SqlClient.SqlConnection(connStr))
+                {
+                    conn.Open();
+                    var cmd = conn.CreateCommand();
+                    cmd.CommandText = @"
+                        SELECT TOP 1 ProcessingStatus, ClaimAI_JobId, DiseaseType
+                        FROM dbo.ClaimAI_Results WITH (NOLOCK)
+                        WHERE ClaimID = @cid
+                        ORDER BY ID DESC";
+                    cmd.Parameters.AddWithValue("@cid", cId);
+                    using (var rdr = cmd.ExecuteReader())
+                    {
+                        if (rdr.Read())
+                        {
+                            status  = rdr["ProcessingStatus"] == DBNull.Value ? null : rdr["ProcessingStatus"].ToString();
+                            jobId   = rdr["ClaimAI_JobId"]    == DBNull.Value ? null : rdr["ClaimAI_JobId"].ToString();
+                            disease = rdr["DiseaseType"]      == DBNull.Value ? null : rdr["DiseaseType"].ToString();
+                        }
+                    }
+                }
+
+                bool hasResult = (status == "done") && !string.IsNullOrWhiteSpace(jobId);
+                return Json(new
+                {
+                    Success = true,
+                    HasResult = hasResult,
+                    Status = status,
+                    JobId = jobId,
+                    DiseaseType = disease
+                }, JsonRequestBehavior.AllowGet);
+            }
+            catch (Exception ex)
+            {
+                // On any error, report no result so the page falls back to on-demand.
+                return Json(new { Success = false, HasResult = false, Message = ex.Message },
+                    JsonRequestBehavior.AllowGet);
+            }
+        }
+
         /// <summary>
         /// GET /MedicalScrutiny/GetCodingProcedureEligibleLimit
         /// Called by ClaimAI to get the exact DB-calculated benefit plan limit
