@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Data;
 using System.Collections.Generic;
 using System.Linq;
@@ -194,6 +194,23 @@ namespace Enrollment
 
         private static readonly TimeSpan Interval = TimeSpan.FromMinutes(5);
 
+        // Simple file logger so we can SEE what the timer is doing (it runs on a
+        // background thread with no UI). Logs to App_Data/Logs/StagingScheduler_*.log.
+        private static void Log(string msg)
+        {
+            try
+            {
+                string dir = System.Web.Hosting.HostingEnvironment.MapPath("~/App_Data/Logs");
+                if (dir == null) dir = System.IO.Path.GetTempPath();
+                if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+                string file = System.IO.Path.Combine(dir,
+                    "StagingScheduler_" + DateTime.Now.ToString("yyyyMMdd") + ".log");
+                System.IO.File.AppendAllText(file,
+                    DateTime.Now.ToString("HH:mm:ss.fff") + "  " + msg + Environment.NewLine);
+            }
+            catch { }
+        }
+
         public static void Start()
         {
             try
@@ -201,19 +218,24 @@ namespace Enrollment
                 string enabled = ConfigurationManager.AppSettings["EnableStagingScheduler"];
                 if (!string.IsNullOrEmpty(enabled) &&
                     enabled.Equals("false", StringComparison.OrdinalIgnoreCase))
+                {
+                    Log("Start() — disabled via EnableStagingScheduler=false. Not starting.");
                     return; // explicitly disabled
+                }
 
                 lock (_lock)
                 {
-                    if (_timer != null) return; // already started
+                    if (_timer != null) { Log("Start() — already started."); return; }
                     // First tick after 1 minute (let the app finish warming up),
                     // then every 5 minutes.
                     _timer = new System.Threading.Timer(
                         Tick, null, TimeSpan.FromMinutes(1), Interval);
+                    Log("Start() — timer created. First tick in 1 min, then every 5 min.");
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Log("Start() EXCEPTION: " + ex.Message);
                 // Never let scheduler startup break app startup.
             }
         }
@@ -226,6 +248,7 @@ namespace Enrollment
                 {
                     _timer.Dispose();
                     _timer = null;
+                    Log("Stop() — timer disposed.");
                 }
             }
         }
@@ -234,16 +257,21 @@ namespace Enrollment
         {
             // Skip this tick if the previous one is still running (no overlap).
             if (System.Threading.Interlocked.CompareExchange(ref _isRunning, 1, 0) != 0)
+            {
+                Log("Tick — skipped (previous tick still running).");
                 return;
+            }
 
             try
             {
+                Log("Tick — firing.");
                 CallProcessStagingClaims();
+                Log("Tick — completed.");
             }
-            catch
+            catch (Exception ex)
             {
-                // Swallow — the endpoint handles its own per-claim errors; a failed
-                // tick just means we try again on the next interval.
+                Log("Tick EXCEPTION: " + ex.Message +
+                    (ex.InnerException != null ? " | inner: " + ex.InnerException.Message : ""));
             }
             finally
             {
@@ -272,6 +300,8 @@ namespace Enrollment
 
             string apiKey = ConfigurationManager.AppSettings["StagingApiKey"] ?? "";
 
+            Log("CallProcessStagingClaims — URL=" + url + (string.IsNullOrEmpty(apiKey) ? " (no key)" : " (with key)"));
+
             System.Net.ServicePointManager.SecurityProtocol =
                 System.Net.SecurityProtocolType.Tls12 |
                 System.Net.SecurityProtocolType.Tls11 |
@@ -290,7 +320,9 @@ namespace Enrollment
                 // Fire and read so the request completes; result handling lives
                 // in the endpoint itself.
                 var resp = client.SendAsync(req).GetAwaiter().GetResult();
-                resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                string snippet = body == null ? "" : (body.Length > 300 ? body.Substring(0, 300) : body);
+                Log("CallProcessStagingClaims — HTTP " + (int)resp.StatusCode + " response: " + snippet);
             }
         }
     }
