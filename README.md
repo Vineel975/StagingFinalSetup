@@ -1,2 +1,1 @@
-UPDATE Claims SET StageID=52 WHERE ID=<NON_CATARACT_CLAIM>;
-DELETE FROM dbo.ClaimAI_Results WHERE ClaimID=<NON_CATARACT_CLAIM>;
+Obstetrics and Gynecology
