@@ -7861,7 +7861,7 @@ namespace Enrollment.Controllers
         ///
         /// Classification is by the claim's Level-3 procedure (level3_ID), which
         /// joins to TPAProcedures and exposes Level1 (the medical specialty):
-        ///   - Ophthalmology                         -> "cataract"
+        ///   - Ophtholmology                         -> "cataract"
         ///   - Obstetrics and Gynecology / OBG       -> "maternity"
         ///   - anything else                         -> "other"
         ///
@@ -7877,7 +7877,7 @@ namespace Enrollment.Controllers
             // Specialties (TPAProcedures.Level1) that map to a supported disease.
             // Extend these sets to add diseases later.
             var cataractSpecialties = new System.Collections.Generic.HashSet<string>(
-                StringComparer.OrdinalIgnoreCase) { "Ophthalmology" };
+                StringComparer.OrdinalIgnoreCase) { "Ophtholmology" };
             var maternitySpecialties = new System.Collections.Generic.HashSet<string>(
                 StringComparer.OrdinalIgnoreCase) { "Obstetrics and Gynecology", "OBG" };
 
