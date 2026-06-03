@@ -1,16 +1,8 @@
-# SPECTRA_BASE_URL = https://localhost:50052
+-- What UHID does OUR ClaimAI lookup get? (MemberPolicy via claim)
+SELECT mp.UHIDNO AS OurUHID
+FROM Claims c WITH (NOLOCK)
+JOIN MemberPolicy mp WITH (NOLOCK) ON mp.ID = c.MemberPolicyID
+WHERE CAST(c.ID AS VARCHAR(50)) = '<CLAIM_ID>' AND ISNULL(c.Deleted,0)=0;
 
-# STAGING_API_KEY = claimai-staging-key-2025
-
-# NEXT_PUBLIC_APP_URL = http://localhost:3000
-
-# CONVEX_DEPLOYMENT=dev:calm-opossum-78 # team: vineel-kakara-4f78d, project: claim-processing-tpa-ppn-7acd2
-
-# NEXT_PUBLIC_CONVEX_URL=https://calm-opossum-78.convex.cloud
-
-# NEXT_PUBLIC_CONVEX_SITE_URL=https://calm-opossum-78.convex.site
-
-# MEMBER_DB_SERVER = AWS-Prod-ReportingSRV02.fhpl.in
-# MEMBER_DB_DATABASE = McarePlus_AI
-# MEMBER_DB_USER = FHPL\satyavineel.k
-# MEMBER_DB_PASSWORD = Cabbage@2001
+-- Does that UHID actually return history rows from the SP?
+EXEC USP_ClaimHistory_Retrieve @Uhidno = '<the OurUHID value from above>';
